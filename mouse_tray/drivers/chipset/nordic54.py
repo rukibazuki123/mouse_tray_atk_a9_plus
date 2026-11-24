@@ -1,7 +1,8 @@
-"""Compx mice on the Nordic 54L15 MCU.
+"""ATK mice using the 64-byte HID battery protocol.
 
 A 64-byte report (ID 8) tagged with command 0x72, on a dedicated HID collection
-(usage page 0xFF05). So far only the ATK Zero uses this silicon.
+(usage page 0xFF05). The Nordic 54L15-based ATK Zero and the NearLink NANO
+receiver used by the ATK A9 Plus both support this battery query.
 
     write   08 7D 72 02 00 00 07 01 00 ...
     read    08 72 00 3A 00 07 01 64 16 11 00 ...
@@ -10,9 +11,8 @@ In the request, byte 2 is the command, byte 5 the link index and byte 6 the
 sub-index (7 = battery). In the reply, byte 2 is a status (``0`` = the mouse
 answered, ``1`` = it did not), byte 3 the payload length, bytes 5-6 echo the
 request, byte 7 is the percent (0x64 = 100%) and bytes 8-9 the cell voltage in
-millivolts, little-endian (0x1116 = 4374 mV). Byte 1 of the request is ignored by
-the device -- 0x00, 0x7C, 0x7D and 0xFF all answer alike -- and is kept at 0x7D
-only because that is what captures show.
+millivolts, little-endian (0x1116 = 4374 mV). The observed requests use 0x7D in
+byte 1. The ATK Zero also answers when that byte is 0x00, 0x7C or 0xFF.
 
 The link index matters: ``0`` reaches a mouse on the cable, ``1`` a mouse behind
 the dongle. With the wrong one the device either stays silent or replays a stale
@@ -24,14 +24,14 @@ is read there. The gauge is voltage-based, so on the cable it saturates at 100%
 during the constant-voltage phase (~4.37 V) while the mouse reads a few percent
 lower once unplugged -- that is the gauge, not a stub value.
 
-Sub-index 7 is the battery; the same command exposes more (8 = charge state,
-0x02 on the cable and 0x00 off it; 9, 0x1A, 0x1C, 0x20, 0x22, 0x23 hold config)
-but the dongle relays only the battery query, so none of it is usable wirelessly.
+On the ATK Zero, sub-index 8 gives the charge state (0x02 on the cable and
+0x00 off it). Sub-indices 9, 0x1A, 0x1C, 0x20, 0x22 and 0x23 hold config.
+Its dongle relays only the battery query.
 
-A receiver is factory-paired to one mouse and its PID depends on the pairing
-channel, so one mouse model ships with several different dongles -- "8k
-dongle-L0" (0x124F), "8k dongle-L1" (0x1155) and so on. They all speak this same
-protocol; each just needs its own row.
+The ATK Zero receiver's PID depends on the pairing channel, so the model ships
+with several different dongles ("8k dongle-L0" at 0x124F, "8k dongle-L1" at
+0x1155, and so on). The A9 Plus is supported via the shared NearLink NANO
+receiver (0x1216).
 
 The older Nordic 52840 mice (ATK/VXE/VGN/Zaopin/Scyrox) speak a simpler 17-byte
 protocol -- see :mod:`~mouse_tray.drivers.chipset.nordic52`. Reference implementation:
@@ -59,7 +59,7 @@ _BATTERY = 0x07  # sub-index of the battery query
 _ASLEEP = BatteryStatus(present=True, asleep=True)
 
 
-def _model(name: str, vid: int, pid_wireless: int, pid_wired: int) -> MouseModel:
+def _model(name: str, vid: int, pid_wireless: int, pid_wired: int | None) -> MouseModel:
     return MouseModel(name, vid, pid_wireless, pid_wired, _USAGE_PAGE, _USAGE)
 
 
@@ -71,6 +71,7 @@ class Nordic54Driver(HidDriver):
         # depending on the pairing channel.
         _model("ATK Zero", 0x373B, 0x1155, 0x1154),  # "8k dongle-L1"
         _model("ATK Zero", 0x373B, 0x124F, 0x1154),  # "8k dongle-L0"
+        _model("ATK A9 Plus / NearLink NANO", 0x373B, 0x1216, None),
     ]
 
     def read_status(self) -> BatteryStatus:

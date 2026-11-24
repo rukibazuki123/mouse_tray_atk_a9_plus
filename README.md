@@ -10,8 +10,9 @@ file, no changes to the UI or polling code.
 
 ## Supported models
 
-- **ATK / VXE / VGN:** ATK F1 Ultimate, ATK A9 Ultimate, ATK Zero, VXE MAD R,
-  VXE MAD R Major Plus, VXE R1 Pro Max, VXE R1 SE+, VGN F1 Pro, VGN F2 Pro Max
+- **ATK / VXE / VGN:** ATK F1 Ultimate, ATK A9 Ultimate, ATK A9 Plus
+  (NearLink NANO receiver, `373B:1216`), ATK Zero, VXE MAD R, VXE MAD R Major
+  Plus, VXE R1 Pro Max, VXE R1 SE+, VGN F1 Pro, VGN F2 Pro Max
 - **Zaopin:** Z2 Mini
 - **Scyrox:** V8
 - **Dareu:** A950 Air, A950 Wing
