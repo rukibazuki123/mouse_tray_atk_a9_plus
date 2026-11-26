@@ -3,10 +3,8 @@
 Two renderers, both producing a fully transparent-background ``wx.Icon`` at the
 native tray size (16px at 100% DPI, scaled up with the display):
 
-* :meth:`IconRenderer.text_icon` -- PIL draws the percentage or status at 4x
-  resolution and averages the glyph coverage onto the native pixels. A
-  compact percent sign sits next to the digits. Separate fill and optional
-  outline masks preserve the glyph colors.
+* Text is drawn at 4x resolution with separate fill and outline masks.
+  Percentages also have a wide bitmap for normal text proportions in the tray.
 * :meth:`IconRenderer.battery_icon` -- an SVG template is filled in with the
   requested color and charge level, then rasterized by ``wx.svg`` (NanoSVG,
   bundled with wxPython -- no extra dependency) straight at the native size.
@@ -20,7 +18,7 @@ channel and the SVG's empty areas come out opaque black.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 
 import wx
@@ -99,6 +97,7 @@ class _TextSpec:
     stroke: int  # outline width (0 draws plain glyphs)
     pct: int  # percent of the fitted size to actually draw
     native: int  # tray edge in physical pixels (the shrink target)
+    wide: bool = False
 
 
 def _text_spec(size_px: int, pct: int = TEXT_SIZE_DEFAULT, outline: bool = True) -> _TextSpec:
@@ -208,66 +207,39 @@ def _glyph_masks(
     return [mask.crop(bounds) for mask in masks] if bounds else masks
 
 
-def _percentage_masks(
-    digits: str, font: ImageFont.FreeTypeFont, outline: int, width: int,
-) -> list[Image.Image]:
-    """Place a small percent sign beside the digits at their full height."""
-    numbers = _glyph_masks(digits, font, _PERCENT_FILL_STROKE, outline)
-    sign_font = font.font_variant(size=max(8, round(width * 0.55)))
-    signs = _glyph_masks("%", sign_font, 1, outline)
-
-    # At 16px, reserve about 4px for the sign and half a pixel of spacing.
-    sign_width = min(signs[0].width, round(width * 9 / 32))
-    gap = max(1, round(width / 32))
-    number_width = min(numbers[0].width, width - gap - sign_width)
-    height = max(numbers[0].height, signs[0].height)
-    masks = []
-    for number_mask, sign_mask in zip(numbers, signs, strict=True):
-        mask = Image.new("L", (number_width + gap + sign_width, height))
-        number = number_mask.resize((number_width, number_mask.height), Image.Resampling.BICUBIC)
-        sign = sign_mask.resize((sign_width, sign_mask.height), Image.Resampling.BICUBIC)
-        mask.paste(number, (0, (height - number.height) // 2))
-        mask.paste(sign, (number_width + gap, (height - sign.height) // 2))
-        masks.append(mask)
-    return masks
-
-
 @lru_cache(maxsize=64)
-def _render_text(
+def _text_bitmap(
     text: str,
     color: tuple[int, int, int],
     font_path: str,
     background: tuple[int, int, int, int],
     spec: _TextSpec,
-) -> wx.Icon:
-    """Draw ``text`` centered at the native tray size on a transparent canvas.
-
-    Fit the readout inside the icon and reduce the coverage masks to native
-    pixels before applying the glyph colors.
-    """
-    digits = text.removesuffix("%")
-    font = _fit_text(digits, font_path, spec)
-    limit = round(spec.box * spec.pct / TEXT_SIZE_DEFAULT)
-    if text.endswith("%"):
-        masks = _percentage_masks(digits, font, spec.stroke, limit)
+) -> wx.Bitmap:
+    """Draw the whole label on one baseline, retaining the font proportions."""
+    if spec.wide:
+        font = ImageFont.truetype(font_path, max(8, round(spec.canvas * 0.75 * spec.pct / TEXT_SIZE_DEFAULT)))
     else:
-        masks = _glyph_masks(text, font, 0, spec.stroke)
+        font = _fit_text(text, font_path, spec)
+    fill_stroke = _PERCENT_FILL_STROKE if text.endswith("%") else 0
+    masks = _glyph_masks(text, font, fill_stroke, spec.stroke)
     colors = (_outline_color(color), color) if spec.stroke else (color,)
 
-    native_size = (spec.native, spec.native)
+    native_size = (spec.native * (2 if spec.wide else 1), spec.native)
+    canvas_size = tuple(edge * _TEXT_SS for edge in native_size)
+    margin = max(1, round(spec.canvas * _TEXT_MARGIN_FRAC))
+    available = tuple(edge - 2 * margin for edge in canvas_size)
+    ratio = min(1, *(edge / mask_edge for edge, mask_edge in zip(available, masks[0].size, strict=True)))
+    fitted_size = tuple(max(1, round(edge * ratio)) for edge in masks[0].size)
+    position = tuple((edge - ink) // 2 for edge, ink in zip(canvas_size, fitted_size, strict=True))
     image = Image.new("RGBA", native_size, background)
     for mask, ink in zip(masks, colors, strict=True):
-        fitted_size = (min(mask.width, limit), min(mask.height, limit))
-        position = tuple((spec.canvas - edge) // 2 for edge in fitted_size)
-        coverage = Image.new("L", (spec.canvas, spec.canvas))
+        coverage = Image.new("L", canvas_size)
         coverage.paste(mask.resize(fitted_size, Image.Resampling.BICUBIC), position)
         layer = Image.new("RGBA", native_size, ink)
         layer.putalpha(coverage.resize(native_size, Image.Resampling.BOX))
         image.alpha_composite(layer)
 
-    icon = wx.Icon()
-    icon.CopyFromBitmap(_pil_to_wx_bitmap(image))
-    return icon
+    return _pil_to_wx_bitmap(image)
 
 
 @lru_cache(maxsize=32)
@@ -323,7 +295,18 @@ class IconRenderer:
         else:
             outline = self.config.text_outline
         spec = _text_spec(self.icon_size, pct, outline)
-        return _render_text(text, fill, font, self.config.background_color, spec)
+        icon = wx.Icon()
+        icon.CopyFromBitmap(_text_bitmap(text, fill, font, self.config.background_color, spec))
+        return icon
+
+    def percentage_bitmap(self, percent: int, color: tuple[int, int, int] | None = None) -> wx.Bitmap:
+        """Render a percentage across the tray button's wider text area."""
+        fill = tuple(color or self.config.foreground_color)
+        font = self.preview_font or self.config.font
+        pct = self.preview_text_size if self.preview_text_size is not None else self.config.text_size
+        outline = self.config.text_outline if self.preview_text_outline is None else self.preview_text_outline
+        spec = _text_spec(self.icon_size, pct, outline)
+        return _text_bitmap(f"{percent}%", fill, font, self.config.background_color, replace(spec, wide=True))
 
     def battery_icon(self, level: int, color: tuple[int, int, int] | None = None) -> wx.Icon:
         """Render a battery filled to ``level`` percent (0-100) as a tray icon.

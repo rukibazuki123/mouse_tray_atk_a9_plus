@@ -8,6 +8,8 @@ from dataclasses import dataclass
 import wx
 from wx.adv import TaskBarIcon
 
+from .tray_text import TrayText
+
 
 @dataclass(frozen=True)
 class MouseChoice:
@@ -49,6 +51,13 @@ class TrayIcon(TaskBarIcon):
         self._on_settings = on_settings
         self._on_about = on_about
         self._on_exit = on_exit
+        self._text_window: TrayText | None = None
+        self._text_bitmap: wx.Bitmap | None = None
+        self._icon: wx.Icon | None = None
+        self._tooltip = ""
+        self._text_visible = False
+        self._position_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self._refresh_text, self._position_timer)
         self.Bind(wx.adv.EVT_TASKBAR_LEFT_DOWN, lambda _evt: self._on_left_click())
 
     def CreatePopupMenu(self) -> wx.Menu:  # noqa: N802 (wx override)
@@ -85,6 +94,47 @@ class TrayIcon(TaskBarIcon):
             self.Bind(wx.EVT_MENU, lambda _evt, key=choice.key: self._on_select_mouse(key), item)
         menu.AppendSeparator()
 
-    def update(self, icon: wx.Icon, tooltip: str) -> None:
+    def update(self, icon: wx.Icon, tooltip: str, text_bitmap: wx.Bitmap | None = None) -> None:
         """Set the tray icon and hover tooltip (safe to call from any thread)."""
-        wx.CallAfter(self.SetIcon, icon, tooltip)
+        wx.CallAfter(self._apply_icon, icon, tooltip, text_bitmap)
+
+    def _apply_icon(self, icon: wx.Icon, tooltip: str, text_bitmap: wx.Bitmap | None) -> None:
+        self._icon, self._tooltip, self._text_bitmap = icon, tooltip, text_bitmap
+        self._text_visible = False
+        self.SetIcon(icon, tooltip)
+        if text_bitmap is not None:
+            if not self._text_window:
+                self._text_window = TrayText()
+            self._refresh_text()
+            self._position_timer.Start(500)
+        else:
+            self._position_timer.Stop()
+            if self._text_window:
+                self._text_window.Hide()
+
+    def _refresh_text(self, _event: wx.TimerEvent | None = None) -> None:
+        if self._text_bitmap is None:
+            return
+        if not self._text_window:
+            self._text_window = TrayText()
+        visible = self._text_window.place(self._text_bitmap)
+        if visible == self._text_visible:
+            return
+        self._text_visible = visible
+        if visible:
+            width, height = self._icon.GetWidth(), self._icon.GetHeight()
+            # An all-zero alpha icon becomes opaque black in the shell.
+            # Use an explicit transparency mask for the empty backing icon.
+            image = wx.Image(width, height)
+            image.SetMaskColour(0, 0, 0)
+            blank = wx.Icon()
+            blank.CopyFromBitmap(wx.Bitmap(image))
+            self.SetIcon(blank, self._tooltip)
+        else:
+            self.SetIcon(self._icon, self._tooltip)
+
+    def Destroy(self) -> None:  # noqa: N802
+        self._position_timer.Stop()
+        if self._text_window:
+            self._text_window.Destroy()
+        super().Destroy()

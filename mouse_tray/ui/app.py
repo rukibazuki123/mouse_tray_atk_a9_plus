@@ -279,7 +279,10 @@ class TrayApp(wx.Frame):
             # The exact number is in the tooltip built above.
             self.tray.update(self.icons.battery_icon(status.percent, color), tooltip)
             return
-        self.tray.update(self.icons.text_icon(f"{status.percent}%", color), tooltip)
+        self.tray.update(
+            self.icons.text_icon(f"{status.percent}%", color), tooltip,
+            self.icons.percentage_bitmap(status.percent, color),
+        )
 
     def _sync_mouse(self, name: str | None) -> None:
         """Load the active mouse's own full-charge date when the mouse changes."""
