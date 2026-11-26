@@ -3,14 +3,10 @@
 Two renderers, both producing a fully transparent-background ``wx.Icon`` at the
 native tray size (16px at 100% DPI, scaled up with the display):
 
-* :meth:`IconRenderer.text_icon` -- PIL draws the percent digits (or a short
-  status glyph) at 4x supersampling and shrinks the result with LANCZOS, so the
-  tray gets a crisp ready-to-use bitmap instead of a big canvas Windows would
-  mush down with a cheap filter. Short strings share the size fitted to the
-  widest pair and the two three-char strings their own size, each centered by
-  its measured ink box in whatever font is configured and scaled to the
-  preferred percent of that fit. A thin contrasting outline (optional) keeps
-  the glyphs readable on any taskbar theme.
+* :meth:`IconRenderer.text_icon` -- PIL draws the percentage or status at 4x
+  resolution and averages the glyph coverage onto the native pixels. The
+  digits set the font size, and the complete readout fits across the icon.
+  Separate fill and optional outline masks preserve the glyph colors.
 * :meth:`IconRenderer.battery_icon` -- an SVG template is filled in with the
   requested color and charge level, then rasterized by ``wx.svg`` (NanoSVG,
   bundled with wxPython -- no extra dependency) straight at the native size.
@@ -37,9 +33,14 @@ from ..resources import icon_path
 #: Tray edge in physical pixels when the DPI scale is unavailable.
 _NATIVE_DEFAULT = 16
 
-#: Text supersampling: glyphs are drawn this many times larger, then shrunk to
-#: the native icon size with LANCZOS.
+#: Text supersampling factor.
 _TEXT_SS = 4
+
+#: A half-pixel boost keeps light fonts readable at the native tray size.
+_PERCENT_FILL_STROKE = _TEXT_SS // 2
+
+#: A 10px font at 100% DPI leaves room for the suffix without tall, narrow digits.
+_PERCENT_FONT_FRAC = 5 / 8
 
 #: Scratch size for the first measurement (independent of the canvas).
 _TEXT_REF_SIZE = 100
@@ -188,29 +189,13 @@ def _overflows(
     return False
 
 
-def _fit_text(
-    draw: ImageDraw.ImageDraw, text: str, font_path: str, spec: _TextSpec
-) -> tuple[ImageFont.FreeTypeFont, tuple[int, int]]:
-    """The tier's em size in ``font_path``, plus the origin centering ``text``.
-
-    Short strings share the size fitted to the widest pair and long ones the
-    size fitted to ``"100"``/``"Zzz"``, scaled to the requested percent (see
-    :func:`_reference_size`). The origin comes from this string's own ink box
-    -- the real extent in this font, outline included -- measured with the
-    default ``la`` anchor that ``draw.text`` shares, so the box maps straight
-    to where the ink lands.
-    """
-    # "100"/"Zzz" are the only 3-char strings; anything longer takes the long
-    # tier as well (no other string exists today).
-    candidates = _SIZE_REF_LONG if len(text) >= 3 else _SIZE_REF_SHORT
+def _fit_text(text: str, font_path: str, spec: _TextSpec) -> ImageFont.FreeTypeFont:
+    """Fit the font to the digits before making room for the percent sign."""
+    candidates = _SIZE_REF_LONG if len(text.removesuffix("%")) >= 3 else _SIZE_REF_SHORT
     size = _reference_size(font_path, spec, candidates)
-    font = ImageFont.truetype(font_path, size)
-    left, top, right, bottom = draw.textbbox((0, 0), text, font=font, stroke_width=spec.stroke)
-    if right - left <= 0 or bottom - top <= 0:  # whitespace only, e.g. the startup placeholder
-        return font, (0, 0)
-    x = round((spec.canvas - (right - left)) / 2 - left)
-    y = round((spec.canvas - (bottom - top)) / 2 - top)
-    return font, (x, y)
+    if text.endswith("%"):
+        size = min(size, round(spec.canvas * _PERCENT_FONT_FRAC * spec.pct / TEXT_SIZE_DEFAULT))
+    return ImageFont.truetype(font_path, size)
 
 
 @lru_cache(maxsize=64)
@@ -223,22 +208,35 @@ def _render_text(
 ) -> wx.Icon:
     """Draw ``text`` centered at the native tray size on a transparent canvas.
 
-    Glyphs are drawn supersampled and shrunk with LANCZOS, and optionally
-    carry a thin contrasting outline so they stay readable on any taskbar
-    theme. Cached like :func:`_render_battery`: the poll loop re-requests the
-    same few strings ("Zzz", "-", a steady percent) tick after tick, and a
-    font, color, size, outline or icon-size change simply lands on new keys
-    (the spec carries the size, outline and icon size).
+    When the suffix makes the label wider than the icon, condense its width
+    before reducing it to native pixels. Drawing the fill and outline as
+    coverage masks keeps their colors through the downsampling step.
     """
-    image = Image.new("RGBA", (spec.canvas, spec.canvas), background)
-    draw = ImageDraw.Draw(image)
-    font, position = _fit_text(draw, text, font_path, spec)
-    draw.text(
-        position, text, font=font, fill=color,
-        stroke_width=spec.stroke, stroke_fill=_outline_color(color),
-    )
+    font = _fit_text(text, font_path, spec)
+    fill_stroke = _PERCENT_FILL_STROKE if text.endswith("%") else 0
+    outline_stroke = fill_stroke + spec.stroke
+    left, top, right, bottom = font.getbbox(text, stroke_width=outline_stroke)
+    ink_size = (max(1, right - left), max(1, bottom - top))
+    limit = round(spec.box * spec.pct / TEXT_SIZE_DEFAULT)
+    fitted_size = (min(ink_size[0], limit), min(ink_size[1], limit))
+    position = tuple((spec.canvas - edge) // 2 for edge in fitted_size)
+
+    native_size = (spec.native, spec.native)
+    image = Image.new("RGBA", native_size, background)
+    layers = [(color, fill_stroke)]
+    if spec.stroke:
+        layers.insert(0, (_outline_color(color), outline_stroke))
+    for ink, stroke in layers:
+        mask = Image.new("L", ink_size)
+        ImageDraw.Draw(mask).text((-left, -top), text, font=font, fill=255, stroke_width=stroke)
+        coverage = Image.new("L", (spec.canvas, spec.canvas))
+        coverage.paste(mask.resize(fitted_size, Image.Resampling.BICUBIC), position)
+        layer = Image.new("RGBA", native_size, ink)
+        layer.putalpha(coverage.resize(native_size, Image.Resampling.BOX))
+        image.alpha_composite(layer)
+
     icon = wx.Icon()
-    icon.CopyFromBitmap(_pil_to_wx_bitmap(image.resize((spec.native, spec.native), Image.LANCZOS)))
+    icon.CopyFromBitmap(_pil_to_wx_bitmap(image))
     return icon
 
 
@@ -284,13 +282,8 @@ class IconRenderer:
     def text_icon(self, text: str, color: tuple[int, int, int] | None = None) -> wx.Icon:
         """Render ``text`` (e.g. a battery percent or "Zzz") as a tray icon.
 
-        Short strings share the size fitted to the widest pair and the two
-        three-char strings their own size, each centered by its own ink box in
-        the configured font (or the live settings preview font/size/outline)
-        and scaled to the size percent. A contrasting outline (optional) keeps
-        it readable on any taskbar theme. ``color`` overrides the configured
-        foreground color when given (used for the charge-level coloring of the
-        battery percent).
+        The configured font, size and outline also apply to percentages like
+        "69%". ``color`` overrides the configured foreground color when given.
         """
         fill = tuple(color or self.config.foreground_color)
         font = self.preview_font or self.config.font
