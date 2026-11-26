@@ -4,9 +4,9 @@ Two renderers, both producing a fully transparent-background ``wx.Icon`` at the
 native tray size (16px at 100% DPI, scaled up with the display):
 
 * :meth:`IconRenderer.text_icon` -- PIL draws the percentage or status at 4x
-  resolution and averages the glyph coverage onto the native pixels. The
-  digits set the font size, and the complete readout fits across the icon.
-  Separate fill and optional outline masks preserve the glyph colors.
+  resolution and averages the glyph coverage onto the native pixels. A
+  compact percent sign sits next to the digits. Separate fill and optional
+  outline masks preserve the glyph colors.
 * :meth:`IconRenderer.battery_icon` -- an SVG template is filled in with the
   requested color and charge level, then rasterized by ``wx.svg`` (NanoSVG,
   bundled with wxPython -- no extra dependency) straight at the native size.
@@ -38,9 +38,6 @@ _TEXT_SS = 4
 
 #: A half-pixel boost keeps light fonts readable at the native tray size.
 _PERCENT_FILL_STROKE = _TEXT_SS // 2
-
-#: A 10px font at 100% DPI leaves room for the suffix without tall, narrow digits.
-_PERCENT_FONT_FRAC = 5 / 8
 
 #: Scratch size for the first measurement (independent of the canvas).
 _TEXT_REF_SIZE = 100
@@ -190,12 +187,49 @@ def _overflows(
 
 
 def _fit_text(text: str, font_path: str, spec: _TextSpec) -> ImageFont.FreeTypeFont:
-    """Fit the font to the digits before making room for the percent sign."""
-    candidates = _SIZE_REF_LONG if len(text.removesuffix("%")) >= 3 else _SIZE_REF_SHORT
-    size = _reference_size(font_path, spec, candidates)
-    if text.endswith("%"):
-        size = min(size, round(spec.canvas * _PERCENT_FONT_FRAC * spec.pct / TEXT_SIZE_DEFAULT))
-    return ImageFont.truetype(font_path, size)
+    """Fit the font for the digits or status text."""
+    candidates = _SIZE_REF_LONG if len(text) >= 3 else _SIZE_REF_SHORT
+    return ImageFont.truetype(font_path, _reference_size(font_path, spec, candidates))
+
+
+def _glyph_masks(
+    text: str, font: ImageFont.FreeTypeFont, fill_stroke: int, outline: int,
+) -> list[Image.Image]:
+    """Draw aligned masks for the glyph and its optional outline."""
+    strokes = (fill_stroke + outline, fill_stroke) if outline else (fill_stroke,)
+    left, top, right, bottom = font.getbbox(text, stroke_width=strokes[0])
+    size = (max(1, right - left), max(1, bottom - top))
+    masks = []
+    for stroke in strokes:
+        mask = Image.new("L", size)
+        ImageDraw.Draw(mask).text((-left, -top), text, font=font, fill=255, stroke_width=stroke)
+        masks.append(mask)
+    bounds = masks[0].getbbox()
+    return [mask.crop(bounds) for mask in masks] if bounds else masks
+
+
+def _percentage_masks(
+    digits: str, font: ImageFont.FreeTypeFont, outline: int, width: int,
+) -> list[Image.Image]:
+    """Place a small percent sign beside the digits at their full height."""
+    numbers = _glyph_masks(digits, font, _PERCENT_FILL_STROKE, outline)
+    sign_font = font.font_variant(size=max(8, round(width * 0.55)))
+    signs = _glyph_masks("%", sign_font, 1, outline)
+
+    # At 16px, reserve about 4px for the sign and half a pixel of spacing.
+    sign_width = min(signs[0].width, round(width * 9 / 32))
+    gap = max(1, round(width / 32))
+    number_width = min(numbers[0].width, width - gap - sign_width)
+    height = max(numbers[0].height, signs[0].height)
+    masks = []
+    for number_mask, sign_mask in zip(numbers, signs, strict=True):
+        mask = Image.new("L", (number_width + gap + sign_width, height))
+        number = number_mask.resize((number_width, number_mask.height), Image.Resampling.BICUBIC)
+        sign = sign_mask.resize((sign_width, sign_mask.height), Image.Resampling.BICUBIC)
+        mask.paste(number, (0, (height - number.height) // 2))
+        mask.paste(sign, (number_width + gap, (height - sign.height) // 2))
+        masks.append(mask)
+    return masks
 
 
 @lru_cache(maxsize=64)
@@ -208,27 +242,23 @@ def _render_text(
 ) -> wx.Icon:
     """Draw ``text`` centered at the native tray size on a transparent canvas.
 
-    When the suffix makes the label wider than the icon, condense its width
-    before reducing it to native pixels. Drawing the fill and outline as
-    coverage masks keeps their colors through the downsampling step.
+    Fit the readout inside the icon and reduce the coverage masks to native
+    pixels before applying the glyph colors.
     """
-    font = _fit_text(text, font_path, spec)
-    fill_stroke = _PERCENT_FILL_STROKE if text.endswith("%") else 0
-    outline_stroke = fill_stroke + spec.stroke
-    left, top, right, bottom = font.getbbox(text, stroke_width=outline_stroke)
-    ink_size = (max(1, right - left), max(1, bottom - top))
+    digits = text.removesuffix("%")
+    font = _fit_text(digits, font_path, spec)
     limit = round(spec.box * spec.pct / TEXT_SIZE_DEFAULT)
-    fitted_size = (min(ink_size[0], limit), min(ink_size[1], limit))
-    position = tuple((spec.canvas - edge) // 2 for edge in fitted_size)
+    if text.endswith("%"):
+        masks = _percentage_masks(digits, font, spec.stroke, limit)
+    else:
+        masks = _glyph_masks(text, font, 0, spec.stroke)
+    colors = (_outline_color(color), color) if spec.stroke else (color,)
 
     native_size = (spec.native, spec.native)
     image = Image.new("RGBA", native_size, background)
-    layers = [(color, fill_stroke)]
-    if spec.stroke:
-        layers.insert(0, (_outline_color(color), outline_stroke))
-    for ink, stroke in layers:
-        mask = Image.new("L", ink_size)
-        ImageDraw.Draw(mask).text((-left, -top), text, font=font, fill=255, stroke_width=stroke)
+    for mask, ink in zip(masks, colors, strict=True):
+        fitted_size = (min(mask.width, limit), min(mask.height, limit))
+        position = tuple((spec.canvas - edge) // 2 for edge in fitted_size)
         coverage = Image.new("L", (spec.canvas, spec.canvas))
         coverage.paste(mask.resize(fitted_size, Image.Resampling.BICUBIC), position)
         layer = Image.new("RGBA", native_size, ink)
